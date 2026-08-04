@@ -6,7 +6,7 @@
 -module(hb_store_remote_node).
 -export([scope/1, type/3, read/3, write/3, link/3, group/3, resolve/3]).
 %%% Public utilities.
--export([maybe_cache/2, maybe_cache/3, read_local_cache/3]).
+-export([maybe_cache/2, maybe_cache/3, maybe_cache_item/3, read_local_cache/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -177,6 +177,29 @@ maybe_cache(StoreOpts, Data, Links) ->
     catch _:_ ->
         ignored
     end.
+
+%% @doc Store a Key Value information inside the store with local-store logic.
+maybe_cache_item(StoreOpts, Key, Data) ->
+    try
+        % Check if the local store is in our store options.
+        case hb_maps:get(<<"local-store">>, StoreOpts, false, StoreOpts) of
+            false ->
+                skipped;
+            Store ->
+                case hb_store:write(Store, #{Key => Data}, StoreOpts) of
+                    {ok, _} ->
+                        %% TODO: Do i need to do something else here?
+                        ok;
+                    {error, Err} ->
+                        ?event(store_remote_node, error_on_local_cache_write),
+                        ?event(warning, {error_caching_remote_node_data, Err}),
+                        {error, Err}
+                end
+        end
+    catch _:_ ->
+        ignored
+    end.
+
 
 %% @doc Read local store cached value. Maintains the `Opts` for the recursive
 %% `hb_cache:read` call, but uses the `StoreOpts` as the source of the

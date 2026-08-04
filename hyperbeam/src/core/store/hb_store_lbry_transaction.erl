@@ -46,9 +46,12 @@ read(StoreOpts, #{ <<"read">> := TxID }, NodeOpts) ->
     end.
 
 fetch_transaction(StoreOpts, TxID, NodeOpts) ->
-    case read_cached_transaction(TxID, NodeOpts) of
-        {ok, Msg} -> {ok, Msg};
-        not_found -> fetch_remote_transaction(StoreOpts, TxID, NodeOpts)
+    case hb_store_remote_node:read_local_cache(StoreOpts, TxID, NodeOpts) of
+        {ok, Raw} when is_binary(Raw) ->
+            % TODO: This converts RAW to Msg. Why we cannot store just Msg?
+            rebuild_cached_transaction(TxID, Raw);
+        _ ->
+            fetch_remote_transaction(StoreOpts, TxID, NodeOpts)
     end.
 
 fetch_remote_transaction(StoreOpts, TxID, NodeOpts) ->
@@ -59,24 +62,11 @@ fetch_remote_transaction(StoreOpts, TxID, NodeOpts) ->
         {ok, Raw} ?= decode_tx_hex(Hex),
         {ok, Msg} ?= hb_lbry_commitment:transaction_message(Raw),
         ok ?= matching_txid(TxID, Msg),
-        write_cached_transaction(TxID, Raw, NodeOpts),
+        hb_store_remote_node:maybe_cache(StoreOpts, #{TxID => Raw}),
         {ok, Msg}
     else
         {error, _} = Error -> Error;
         {failure, _} = Failure -> Failure
-    end.
-
-read_cached_transaction(TxID, NodeOpts) ->
-    case local_stores(NodeOpts) of
-        [] ->
-            not_found;
-        Stores ->
-            case hb_store:read(Stores, cache_path(TxID), NodeOpts) of
-                {ok, Raw} when is_binary(Raw) ->
-                    rebuild_cached_transaction(TxID, Raw);
-                _ ->
-                    not_found
-            end
     end.
 
 rebuild_cached_transaction(TxID, Raw) ->
@@ -86,26 +76,6 @@ rebuild_cached_transaction(TxID, Raw) ->
         {ok, Msg}
     else
         _ -> not_found
-    end.
-
-write_cached_transaction(TxID, Raw, NodeOpts) ->
-    case local_stores(NodeOpts) of
-        [] ->
-            ok;
-        Stores ->
-            try hb_store:write(Stores, #{ cache_path(TxID) => Raw }, NodeOpts)
-            catch _:_ -> ok
-            end
-    end.
-
-cache_path(TxID) ->
-    <<"lbry-transaction/", TxID/binary>>.
-
-local_stores(NodeOpts) ->
-    case hb_opts:get(store, [], NodeOpts) of
-        Stores when is_list(Stores) -> hb_store:scope(Stores, local);
-        Store when is_map(Store) -> hb_store:scope([Store], local);
-        _ -> []
     end.
 
 %% The proxy node and HTTP client may be pinned per-store; otherwise the
@@ -239,7 +209,7 @@ read_serves_cached_transaction_without_proxy_test() ->
         % The verified raw bytes were written through to the local store.
         ?assertMatch(
             {ok, _},
-            hb_store:read([Cache], cache_path(TxID), NodeOpts)
+            hb_store:read([Cache], TxID, NodeOpts)
         ),
         hb_mock_server:stop(Handle),
         % With the proxy gone, the read is served from the local store.
@@ -264,14 +234,14 @@ read_refetches_on_corrupted_cache_entry_test() ->
     {ok, Server, Handle} = proxy_server(hb_lbry_tx:task0_tx_hex()),
     NodeOpts = #{ <<"http-client">> => httpc, <<"store">> => [Cache] },
     try
-        ok = hb_store:write([Cache], #{ cache_path(TxID) => <<"garbage">> }, NodeOpts),
+        ok = hb_store:write([Cache], #{ TxID => <<"garbage">> }, NodeOpts),
         Store = store(Server),
         {ok, Msg} = read(Store, #{ <<"read">> => TxID }, NodeOpts),
         ?assertEqual(TxID, maps:get(<<"txid">>, Msg)),
         % The refetch replaced the corrupted entry with the verified bytes.
         ?assertEqual(
             {ok, binary:decode_hex(hb_lbry_tx:task0_tx_hex())},
-            hb_store:read([Cache], cache_path(TxID), NodeOpts)
+            hb_store:read([Cache], TxID, NodeOpts)
         )
     after
         hb_mock_server:stop(Handle),
