@@ -4,11 +4,11 @@
 %%% requested key. The result is a HyperBEAM message carrying the raw bytes
 %%% and a native `lbry-transaction@1.0' commitment.
 %%%
-%%% Confirmed transactions are immutable, so the verified raw bytes are
-%%% written through to the node's local stores and served from there on
-%%% subsequent reads. Cached bytes pass through the same txid verification
-%%% as remote fetches, so a corrupted cache entry degrades to a refetch
-%%% rather than serving bad evidence.
+%%% Confirmed transactions are immutable, so the committed transaction message
+%%% is written through to the configured local store under its HyperBEAM ID and
+%%% linked from the display-order txid. Cached bytes pass through the same txid
+%%% verification as remote fetches, so a corrupted cache entry degrades to a
+%%% refetch rather than serving bad evidence.
 -module(hb_store_lbry_transaction).
 -export([scope/0, scope/1, type/3, read/3, resolve/3]).
 -include("include/hb.hrl").
@@ -47,11 +47,31 @@ read(StoreOpts, #{ <<"read">> := TxID }, NodeOpts) ->
 
 fetch_transaction(StoreOpts, TxID, NodeOpts) ->
     case hb_store_remote_node:read_local_cache(StoreOpts, TxID, NodeOpts) of
-        {ok, Raw} when is_binary(Raw) ->
-            % TODO: This converts RAW to Msg. Why we cannot store just Msg?
-            rebuild_cached_transaction(TxID, Raw);
+        {ok, Msg} ->
+            case verify_cached_transaction(StoreOpts, TxID, Msg, NodeOpts) of
+                {ok, VerifiedMsg} -> {ok, VerifiedMsg};
+                _ -> fetch_remote_transaction(StoreOpts, TxID, NodeOpts)
+            end;
         _ ->
             fetch_remote_transaction(StoreOpts, TxID, NodeOpts)
+    end.
+
+verify_cached_transaction(StoreOpts, TxID, Msg, NodeOpts) ->
+    try
+        CacheOpts = hb_store_remote_node:local_cache_opts(StoreOpts, NodeOpts),
+        Loaded = hb_cache:ensure_all_loaded(Msg, CacheOpts),
+        maybe
+            true ?= is_map(Loaded),
+            Raw ?= hb_maps:get(<<"raw">>, Loaded, not_found, CacheOpts),
+            true ?= is_binary(Raw),
+            {ok, VerifiedMsg} ?= hb_lbry_commitment:transaction_message(Raw),
+            ok ?= matching_txid(TxID, VerifiedMsg),
+            {ok, VerifiedMsg}
+        else
+            _ -> not_found
+        end
+    catch
+        _:_ -> not_found
     end.
 
 fetch_remote_transaction(StoreOpts, TxID, NodeOpts) ->
@@ -62,20 +82,11 @@ fetch_remote_transaction(StoreOpts, TxID, NodeOpts) ->
         {ok, Raw} ?= decode_tx_hex(Hex),
         {ok, Msg} ?= hb_lbry_commitment:transaction_message(Raw),
         ok ?= matching_txid(TxID, Msg),
-        hb_store_remote_node:maybe_cache(StoreOpts, #{TxID => Raw}),
+        hb_store_remote_node:maybe_cache(StoreOpts, Msg, [TxID]),
         {ok, Msg}
     else
         {error, _} = Error -> Error;
         {failure, _} = Failure -> Failure
-    end.
-
-rebuild_cached_transaction(TxID, Raw) ->
-    maybe
-        {ok, Msg} ?= hb_lbry_commitment:transaction_message(Raw),
-        ok ?= matching_txid(TxID, Msg),
-        {ok, Msg}
-    else
-        _ -> not_found
     end.
 
 %% The proxy node and HTTP client may be pinned per-store; otherwise the
@@ -202,15 +213,16 @@ read_serves_cached_transaction_without_proxy_test() ->
     },
     ok = hb_store:start(Cache),
     {ok, Server, Handle} = proxy_server(hb_lbry_tx:task0_tx_hex()),
-    NodeOpts = #{ <<"http-client">> => httpc, <<"store">> => [Cache] },
     try
-        Store = store(Server),
+        Store = store(Server, Cache),
+        NodeOpts = #{
+            <<"http-client">> => httpc,
+            <<"store">> => Store
+        },
         {ok, First} = read(Store, #{ <<"read">> => TxID }, NodeOpts),
-        % The verified raw bytes were written through to the local store.
-        ?assertMatch(
-            {ok, _},
-            hb_store:read([Cache], TxID, NodeOpts)
-        ),
+        {ok, Cached0} = hb_cache:read(TxID, #{ <<"store">> => [Cache] }),
+        Cached = hb_cache:ensure_all_loaded(Cached0, #{ <<"store">> => [Cache] }),
+        ?assertEqual(TxID, maps:get(<<"txid">>, Cached)),
         hb_mock_server:stop(Handle),
         % With the proxy gone, the read is served from the local store.
         {ok, Second} = read(Store, #{ <<"read">> => TxID }, NodeOpts),
@@ -235,14 +247,13 @@ read_refetches_on_corrupted_cache_entry_test() ->
     NodeOpts = #{ <<"http-client">> => httpc, <<"store">> => [Cache] },
     try
         ok = hb_store:write([Cache], #{ TxID => <<"garbage">> }, NodeOpts),
-        Store = store(Server),
+        Store = store(Server, Cache),
         {ok, Msg} = read(Store, #{ <<"read">> => TxID }, NodeOpts),
         ?assertEqual(TxID, maps:get(<<"txid">>, Msg)),
-        % The refetch replaced the corrupted entry with the verified bytes.
-        ?assertEqual(
-            {ok, binary:decode_hex(hb_lbry_tx:task0_tx_hex())},
-            hb_store:read([Cache], TxID, NodeOpts)
-        )
+        {ok, Cached0} = hb_cache:read(TxID, #{ <<"store">> => [Cache] }),
+        Cached = hb_cache:ensure_all_loaded(Cached0, #{ <<"store">> => [Cache] }),
+        ?assertEqual(TxID, maps:get(<<"txid">>, Cached)),
+        ?assertEqual(binary:decode_hex(hb_lbry_tx:task0_tx_hex()), maps:get(<<"raw">>, Cached))
     after
         hb_mock_server:stop(Handle),
         hb_store:stop(Cache)
@@ -266,3 +277,5 @@ store(Server) ->
         <<"lbry-proxy-node">> => Server,
         <<"http-client">> => httpc
     }.
+store(Server, LocalStore) ->
+    maps:merge(store(Server), #{ <<"local-store">> => LocalStore }).
